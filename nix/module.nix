@@ -19,21 +19,81 @@ let
   generateSecretsScript = pkgs.writeShellScript "devpush-generate-secrets" ''
     set -euo pipefail
 
-    SECRETS_FILE="${cfg.dataDir}/.secrets"
+    SECRETS_DIR="${cfg.dataDir}/secrets"
+    GENERATED_NEW=false
 
-    if [[ ! -f "$SECRETS_FILE" ]]; then
-      echo "Generating DevPush secrets..."
-      SECRET_KEY=$(${pkgs.openssl}/bin/openssl rand -hex 32)
-      ENCRYPTION_KEY=$(${pkgs.openssl}/bin/openssl rand -base64 32 | tr '+/' '-_')
-      POSTGRES_PASSWORD=$(${pkgs.openssl}/bin/openssl rand -hex 32)
+    # Create secrets directory if it doesn't exist
+    if [[ ! -d "$SECRETS_DIR" ]]; then
+      mkdir -p "$SECRETS_DIR"
+      chmod 700 "$SECRETS_DIR"
+      chown ${cfg.user}:${cfg.group} "$SECRETS_DIR"
+    fi
 
-      cat > "$SECRETS_FILE" <<EOF
-SECRET_KEY=$SECRET_KEY
-ENCRYPTION_KEY=$ENCRYPTION_KEY
-POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+    # Generate encryption key if missing
+    if [[ ! -f "$SECRETS_DIR/encryption.key" ]]; then
+      echo "Generating encryption key..."
+      ${pkgs.openssl}/bin/openssl rand -base64 32 | tr '+/' '-_' > "$SECRETS_DIR/encryption.key"
+      chmod 600 "$SECRETS_DIR/encryption.key"
+      chown ${cfg.user}:${cfg.group} "$SECRETS_DIR/encryption.key"
+      GENERATED_NEW=true
+    fi
+
+    # Generate session key if missing
+    if [[ ! -f "$SECRETS_DIR/session.key" ]]; then
+      echo "Generating session key..."
+      ${pkgs.openssl}/bin/openssl rand -hex 32 > "$SECRETS_DIR/session.key"
+      chmod 600 "$SECRETS_DIR/session.key"
+      chown ${cfg.user}:${cfg.group} "$SECRETS_DIR/session.key"
+      GENERATED_NEW=true
+    fi
+
+    # Generate postgres password if missing
+    if [[ ! -f "$SECRETS_DIR/postgres.password" ]]; then
+      echo "Generating postgres password..."
+      ${pkgs.openssl}/bin/openssl rand -hex 32 > "$SECRETS_DIR/postgres.password"
+      chmod 600 "$SECRETS_DIR/postgres.password"
+      chown ${cfg.user}:${cfg.group} "$SECRETS_DIR/postgres.password"
+      GENERATED_NEW=true
+    fi
+
+    # Create README if it doesn't exist
+    if [[ ! -f "$SECRETS_DIR/README.txt" ]]; then
+      cat > "$SECRETS_DIR/README.txt" <<'EOF'
+DevPush Secrets Directory
+=========================
+
+This directory contains cryptographic keys and passwords essential to DevPush.
+These files are automatically generated on first run if not present.
+
+Files:
+  encryption.key   - Used to encrypt sensitive data in the database.
+                     If lost, encrypted data becomes unrecoverable.
+
+  session.key      - Used for signing session tokens.
+                     If changed, all active sessions will be invalidated.
+
+  postgres.password - Password for the PostgreSQL database.
+                     Must match the password used when the database was created.
+
+IMPORTANT: Back up this entire directory!
+Without these keys, your data cannot be recovered.
 EOF
-      chmod 600 "$SECRETS_FILE"
-      chown ${cfg.user}:${cfg.group} "$SECRETS_FILE"
+      chmod 644 "$SECRETS_DIR/README.txt"
+      chown ${cfg.user}:${cfg.group} "$SECRETS_DIR/README.txt"
+    fi
+
+    # Warn on first generation
+    if [[ "$GENERATED_NEW" == "true" ]]; then
+      echo ""
+      echo "========================================================"
+      echo "WARNING: New cryptographic secrets have been generated."
+      echo ""
+      echo "BACK UP THIS DIRECTORY IMMEDIATELY:"
+      echo "  ${cfg.dataDir}/secrets/"
+      echo ""
+      echo "Without these files, your data cannot be recovered."
+      echo "========================================================"
+      echo ""
     fi
   '';
 
@@ -42,8 +102,40 @@ EOF
     set -euo pipefail
 
     ENV_FILE="${cfg.dataDir}/.env"
-    SECRETS_FILE="${cfg.dataDir}/.secrets"
+    SECRETS_DIR="${cfg.dataDir}/secrets"
     USER_SECRETS="${cfg.secretsFile}"
+
+    # Helper to read a secret, with optional override from user secrets file
+    read_secret() {
+      local name="$1"
+      local file="$2"
+      local value=""
+
+      # Check user secrets file first (takes priority)
+      if [[ -f "$USER_SECRETS" ]]; then
+        value=$(${pkgs.gnugrep}/bin/grep -E "^$name=" "$USER_SECRETS" 2>/dev/null | head -1 | cut -d= -f2- || true)
+      fi
+
+      # Fall back to auto-generated secret
+      if [[ -z "$value" && -f "$file" ]]; then
+        value=$(cat "$file")
+      fi
+
+      # Error if still empty
+      if [[ -z "$value" ]]; then
+        echo "ERROR: Required secret '$name' not found." >&2
+        echo "Expected at: $file" >&2
+        echo "Or provide it in: $USER_SECRETS" >&2
+        exit 1
+      fi
+
+      echo "$value"
+    }
+
+    # Read secrets (user-provided values override auto-generated)
+    ENCRYPTION_KEY=$(read_secret "ENCRYPTION_KEY" "$SECRETS_DIR/encryption.key")
+    SECRET_KEY=$(read_secret "SECRET_KEY" "$SECRETS_DIR/session.key")
+    POSTGRES_PASSWORD=$(read_secret "POSTGRES_PASSWORD" "$SECRETS_DIR/postgres.password")
 
     # Get UID/GID
     SERVICE_UID=$(${pkgs.coreutils}/bin/id -u ${cfg.user})
@@ -62,13 +154,11 @@ EOF
     # Note: DATA_DIR, APP_DIR, LOG_DIR are intentionally NOT included here.
     # These are host paths used by docker-compose for volume mounts (passed via
     # shell environment). The app container uses its defaults (/data, /app).
-    cat > "$ENV_FILE" <<'ENVEOF'
+    cat > "$ENV_FILE" <<ENVEOF
 # DevPush Configuration
 # Generated by NixOS module - do not edit directly
 
 # Service user
-ENVEOF
-    cat >> "$ENV_FILE" <<ENVEOF
 SERVICE_UID=$SERVICE_UID
 SERVICE_GID=$SERVICE_GID
 
@@ -84,20 +174,18 @@ CERT_CHALLENGE_PROVIDER=${cfg.settings.certChallengeProvider}
 # Database
 POSTGRES_DB=devpush
 POSTGRES_USER=devpush-app
+POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+
+# Secrets
+ENCRYPTION_KEY=$ENCRYPTION_KEY
+SECRET_KEY=$SECRET_KEY
 ENVEOF
 
-    # Append auto-generated secrets
-    if [[ -f "$SECRETS_FILE" ]]; then
-      echo "" >> "$ENV_FILE"
-      echo "# Auto-generated secrets" >> "$ENV_FILE"
-      cat "$SECRETS_FILE" >> "$ENV_FILE"
-    fi
-
-    # Append user secrets
+    # Append remaining user secrets (excluding ones we already handled)
     if [[ -f "$USER_SECRETS" ]]; then
       echo "" >> "$ENV_FILE"
-      echo "# User-provided secrets" >> "$ENV_FILE"
-      cat "$USER_SECRETS" >> "$ENV_FILE"
+      echo "# User-provided configuration" >> "$ENV_FILE"
+      ${pkgs.gnugrep}/bin/grep -vE "^(ENCRYPTION_KEY|SECRET_KEY|POSTGRES_PASSWORD)=" "$USER_SECRETS" >> "$ENV_FILE" || true
     fi
 
     chmod 600 "$ENV_FILE"
@@ -133,7 +221,16 @@ ENVEOF
   migrateScript = pkgs.writeShellScript "devpush-migrate" ''
     set -euo pipefail
 
+    STATUS_FILE="${cfg.dataDir}/.last-start-status"
+
+    log_status() {
+      echo "[$(date -Iseconds)] $1" >> "$STATUS_FILE"
+      echo "$1"
+    }
+
     # Wait for app container to be ready
+    log_status "Waiting for app container..."
+    CONTAINER=""
     for i in $(seq 1 30); do
       CONTAINER=$(${pkgs.docker}/bin/docker ps --filter "label=com.docker.compose.project=devpush" --filter "label=com.docker.compose.service=app" -q | head -1 || true)
       if [[ -n "$CONTAINER" ]]; then
@@ -145,13 +242,203 @@ ENVEOF
       sleep 2
     done
 
-    if [[ -z "''${CONTAINER:-}" ]]; then
-      echo "App container not found, skipping migrations"
-      exit 0
+    if [[ -z "$CONTAINER" ]]; then
+      log_status "ERROR: App container not found after 60 seconds."
+      log_status "Check container logs: docker compose -p devpush logs app"
+      log_status "Check if containers are starting: docker ps -a | grep devpush"
+      exit 1
     fi
 
-    echo "Running database migrations..."
-    ${pkgs.docker}/bin/docker exec "$CONTAINER" uv run alembic upgrade head || true
+    log_status "Running database migrations..."
+    if ! ${pkgs.docker}/bin/docker exec "$CONTAINER" uv run alembic upgrade head 2>&1 | tee -a "$STATUS_FILE"; then
+      log_status "ERROR: Database migration failed."
+      log_status "This may indicate:"
+      log_status "  - Database connection issues (wrong password?)"
+      log_status "  - Schema conflicts from a previous version"
+      log_status "  - Missing database initialization"
+      log_status "Check postgres logs: docker compose -p devpush logs pgsql"
+      exit 1
+    fi
+
+    log_status "Migrations completed successfully."
+  '';
+
+  # Script to validate state consistency
+  validateStateScript = pkgs.writeShellScript "devpush-validate-state" ''
+    set -euo pipefail
+
+    SECRETS_DIR="${cfg.dataDir}/secrets"
+    STRICT="${if cfg.strictStateValidation then "true" else "false"}"
+    HAS_ERRORS=false
+
+    warn() {
+      echo "WARNING: $1" >&2
+    }
+
+    error() {
+      echo "ERROR: $1" >&2
+      HAS_ERRORS=true
+    }
+
+    # Check 1: Postgres password vs existing database volume
+    USER_SECRETS="${cfg.secretsFile}"
+    USER_PROVIDED_PASSWORD=false
+    if [[ -f "$USER_SECRETS" ]] && ${pkgs.gnugrep}/bin/grep -qE "^POSTGRES_PASSWORD=" "$USER_SECRETS" 2>/dev/null; then
+      USER_PROVIDED_PASSWORD=true
+    fi
+
+    if [[ -f "$SECRETS_DIR/postgres.password" ]]; then
+      # Check if devpush-db volume exists (indicates prior database)
+      if ${pkgs.docker}/bin/docker volume inspect devpush_devpush-db >/dev/null 2>&1; then
+        CURRENT_HASH=$(${pkgs.coreutils}/bin/sha256sum "$SECRETS_DIR/postgres.password" | cut -d' ' -f1)
+        STORED_HASH=""
+        if [[ -f "$SECRETS_DIR/.postgres-password-hash" ]]; then
+          STORED_HASH=$(cat "$SECRETS_DIR/.postgres-password-hash")
+        fi
+
+        if [[ -z "$STORED_HASH" ]]; then
+          if [[ "$USER_PROVIDED_PASSWORD" == "true" ]]; then
+            # User explicitly provided password - trust them
+            echo "Note: Using user-provided POSTGRES_PASSWORD from secretsFile."
+          else
+            # Auto-generated password with no hash - likely a mismatch
+            error "Database volume exists but no password hash on record."
+            error "This may indicate the database was created with a different password"
+            error "(e.g., from a previous .secrets file or manual setup)."
+            error ""
+            error "If you have the original password, add it to your secretsFile as POSTGRES_PASSWORD=..."
+            error "Or delete the database volume to start fresh:"
+            error "  docker volume rm devpush_devpush-db"
+          fi
+        elif [[ "$CURRENT_HASH" != "$STORED_HASH" ]]; then
+          if [[ "$USER_PROVIDED_PASSWORD" == "true" ]]; then
+            # User changed password intentionally - warn but allow
+            warn "POSTGRES_PASSWORD in secretsFile differs from previously used password."
+            warn "If this is intentional, you may need to update the database password manually."
+          else
+            error "Postgres password has changed but database volume exists."
+            error "The database was created with a different password."
+            error "Either restore the original secrets/postgres.password or delete the database volume:"
+            error "  docker volume rm devpush_devpush-db"
+          fi
+        fi
+      fi
+    fi
+
+    # Check 2: Encryption key consistency
+    USER_PROVIDED_ENCRYPTION_KEY=false
+    if [[ -f "$USER_SECRETS" ]] && ${pkgs.gnugrep}/bin/grep -qE "^ENCRYPTION_KEY=" "$USER_SECRETS" 2>/dev/null; then
+      USER_PROVIDED_ENCRYPTION_KEY=true
+    fi
+
+    if [[ -f "$SECRETS_DIR/encryption.key" ]]; then
+      # Only check if there's a database that might have encrypted data
+      if ${pkgs.docker}/bin/docker volume inspect devpush_devpush-db >/dev/null 2>&1; then
+        CURRENT_HASH=$(${pkgs.coreutils}/bin/sha256sum "$SECRETS_DIR/encryption.key" | cut -d' ' -f1)
+        STORED_HASH=""
+        if [[ -f "$SECRETS_DIR/.encryption-key-hash" ]]; then
+          STORED_HASH=$(cat "$SECRETS_DIR/.encryption-key-hash")
+        fi
+
+        if [[ -z "$STORED_HASH" ]]; then
+          if [[ "$USER_PROVIDED_ENCRYPTION_KEY" == "true" ]]; then
+            # User explicitly provided key - trust them
+            echo "Note: Using user-provided ENCRYPTION_KEY from secretsFile."
+          else
+            # Auto-generated key with no hash - warn about potential mismatch
+            warn "Database exists but no encryption key hash on record."
+            warn "If encrypted data exists, it may have been encrypted with a different key."
+            warn "Ensure secrets/encryption.key matches the original, or data may be unreadable."
+          fi
+        elif [[ "$CURRENT_HASH" != "$STORED_HASH" ]]; then
+          if [[ "$USER_PROVIDED_ENCRYPTION_KEY" == "true" ]]; then
+            # User changed key intentionally - warn but allow
+            warn "ENCRYPTION_KEY in secretsFile differs from previously used key."
+            warn "Data encrypted with the old key will be unreadable."
+          else
+            error "Encryption key has changed but database exists with potentially encrypted data."
+            error "Data encrypted with the old key will be unrecoverable."
+            error "Restore the original secrets/encryption.key or start fresh:"
+            error "  docker volume rm devpush_devpush-db"
+          fi
+        fi
+      fi
+    fi
+
+    # Exit based on strict mode (before storing hashes!)
+    if [[ "$HAS_ERRORS" == "true" ]]; then
+      if [[ "$STRICT" == "true" ]]; then
+        echo ""
+        echo "State validation failed. Set strictStateValidation = false to override."
+        exit 1
+      else
+        echo ""
+        warn "State validation found issues but strictStateValidation is disabled."
+        warn "Proceeding anyway - data corruption may occur."
+      fi
+    fi
+
+    # Store current hashes for future runs (only after validation passes)
+    if [[ -f "$SECRETS_DIR/postgres.password" ]]; then
+      ${pkgs.coreutils}/bin/sha256sum "$SECRETS_DIR/postgres.password" | cut -d' ' -f1 > "$SECRETS_DIR/.postgres-password-hash"
+      chmod 600 "$SECRETS_DIR/.postgres-password-hash"
+      chown ${cfg.user}:${cfg.group} "$SECRETS_DIR/.postgres-password-hash"
+    fi
+
+    if [[ -f "$SECRETS_DIR/encryption.key" ]]; then
+      ${pkgs.coreutils}/bin/sha256sum "$SECRETS_DIR/encryption.key" | cut -d' ' -f1 > "$SECRETS_DIR/.encryption-key-hash"
+      chmod 600 "$SECRETS_DIR/.encryption-key-hash"
+      chown ${cfg.user}:${cfg.group} "$SECRETS_DIR/.encryption-key-hash"
+    fi
+  '';
+
+  # Script to create backup manifest
+  createBackupManifestScript = pkgs.writeShellScript "devpush-create-backup-manifest" ''
+    set -euo pipefail
+
+    MANIFEST="${cfg.dataDir}/BACKUP.txt"
+
+    # Only create if it doesn't exist (don't overwrite user modifications)
+    if [[ ! -f "$MANIFEST" ]]; then
+      cat > "$MANIFEST" <<'EOF'
+DevPush Backup Checklist
+========================
+
+Back up these paths together - they are interdependent:
+
+CRITICAL - Data is unrecoverable without these:
+  secrets/                   - Encryption keys and database password
+                               Without these, encrypted data cannot be decrypted
+                               and the database cannot be accessed.
+
+IMPORTANT - Service state:
+  traefik/acme.json          - Let's Encrypt certificates
+                               Can be regenerated, but rate limits apply.
+
+  upload/                    - User-uploaded files
+
+  Docker volume: devpush_devpush-db
+                             - PostgreSQL database containing all application data
+
+
+To back up the database:
+  docker exec devpush-pgsql-1 pg_dump -U devpush-app devpush > backup.sql
+
+To restore the database:
+  cat backup.sql | docker exec -i devpush-pgsql-1 psql -U devpush-app devpush
+
+
+Recovery procedure:
+  1. Restore secrets/ directory FIRST (before starting services)
+  2. Start services to create fresh database volume
+  3. Stop services
+  4. Restore database from backup
+  5. Restore upload/ directory
+  6. Restart services
+EOF
+      chmod 644 "$MANIFEST"
+      chown ${cfg.user}:${cfg.group} "$MANIFEST"
+    fi
   '';
 
 in {
@@ -248,6 +535,20 @@ in {
       '';
       example = "/run/secrets/devpush.env";
     };
+
+    strictStateValidation = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Refuse to start if state inconsistencies are detected.
+
+        When enabled, DevPush will fail to start if:
+        - The postgres password has changed but the database volume exists
+        - The encryption key has changed but encrypted data may exist
+
+        Set to false to log warnings but attempt to start anyway.
+      '';
+    };
   };
 
   config = mkIf cfg.enable {
@@ -290,8 +591,14 @@ in {
           echo "Generating secrets..."
           ${generateSecretsScript}
 
+          echo "Validating state consistency..."
+          ${validateStateScript}
+
           echo "Building environment file..."
           ${buildEnvScript}
+
+          echo "Creating backup manifest..."
+          ${createBackupManifestScript}
 
           echo "Ensuring acme.json exists..."
           touch ${cfg.dataDir}/traefik/acme.json
@@ -331,22 +638,40 @@ in {
         ExecStart = pkgs.writeShellScript "devpush-start" ''
           set -euo pipefail
 
-          echo "Starting DevPush..."
-          ${pkgs.docker}/bin/docker compose \
+          STATUS_FILE="${cfg.dataDir}/.last-start-status"
+
+          log_status() {
+            echo "[$(date -Iseconds)] $1" >> "$STATUS_FILE"
+            echo "$1"
+          }
+
+          # Clear status file for new start
+          echo "# DevPush startup log - $(date -Iseconds)" > "$STATUS_FILE"
+          chmod 640 "$STATUS_FILE"
+          chown ${cfg.user}:${cfg.group} "$STATUS_FILE"
+
+          log_status "Starting DevPush containers..."
+          if ! ${pkgs.docker}/bin/docker compose \
             -p devpush \
             --env-file ${cfg.dataDir}/.env \
             ${composeFileArgs} \
-            up -d --remove-orphans
+            up -d --remove-orphans 2>&1 | tee -a "$STATUS_FILE"; then
+            log_status "ERROR: Failed to start containers."
+            log_status "Check docker compose config: docker compose -p devpush config"
+            exit 1
+          fi
 
           # Wait for app to be ready
-          echo "Waiting for app container..."
+          log_status "Waiting for app container to be ready..."
+          APP_READY=false
           for i in $(seq 1 60); do
             CONTAINER=$(${pkgs.docker}/bin/docker ps --filter "label=com.docker.compose.project=devpush" --filter "label=com.docker.compose.service=app" -q | head -1 || true)
             if [[ -n "$CONTAINER" ]]; then
               STATUS=$(${pkgs.docker}/bin/docker inspect --format '{{.State.Status}}{{if .State.Health}}:{{.State.Health.Status}}{{end}}' "$CONTAINER" 2>/dev/null || true)
               case "$STATUS" in
                 running:healthy|running)
-                  echo "App container is ready."
+                  log_status "App container is ready (status: $STATUS)."
+                  APP_READY=true
                   break
                   ;;
               esac
@@ -354,10 +679,14 @@ in {
             sleep 2
           done
 
+          if [[ "$APP_READY" != "true" ]]; then
+            log_status "WARNING: App container not ready after 120 seconds, proceeding with migrations anyway."
+          fi
+
           # Run migrations
           ${migrateScript}
 
-          echo "DevPush started successfully."
+          log_status "DevPush started successfully."
         '';
 
         ExecStop = pkgs.writeShellScript "devpush-stop" ''
