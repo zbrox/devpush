@@ -179,7 +179,35 @@ POSTGRES_PASSWORD=$POSTGRES_PASSWORD
 # Secrets
 ENCRYPTION_KEY=$ENCRYPTION_KEY
 SECRET_KEY=$SECRET_KEY
+
+# Resource limits
+DEFAULT_CPUS=${toString cfg.settings.defaultCpus}
+DEFAULT_MEMORY_MB=${toString cfg.settings.defaultMemoryMb}
+MAX_CPUS=${toString cfg.settings.maxCpus}
+MAX_MEMORY_MB=${toString cfg.settings.maxMemoryMb}
+ALLOW_CUSTOM_RESOURCES=${if cfg.settings.allowCustomResources then "true" else "false"}
+
+# Timeouts
+JOB_TIMEOUT=${toString cfg.settings.jobTimeout}
+DEPLOYMENT_TIMEOUT=${toString cfg.settings.deploymentTimeout}
+
+# Branding
+APP_NAME=${cfg.settings.appName}
+${optionalString (cfg.settings.appDescription != null) "APP_DESCRIPTION=${cfg.settings.appDescription}"}
+EMAIL_SENDER_NAME=${cfg.settings.emailSenderName}
+
+# Logging
+LOG_LEVEL=${cfg.settings.logLevel}
 ENVEOF
+
+${optionalString (cfg.extraEnv != {}) ''
+    # Extra environment variables
+    cat >> "$ENV_FILE" <<'EXTRAENVEOF'
+
+# Extra configuration
+${lib.concatStringsSep "\n" (lib.mapAttrsToList (name: value: "${name}=${value}") cfg.extraEnv)}
+EXTRAENVEOF
+''}
 
     # Append remaining user secrets (excluding ones we already handled)
     if [[ -f "$USER_SECRETS" ]]; then
@@ -514,6 +542,76 @@ in {
           in your secretsFile.
         '';
       };
+
+      # Resource limits
+      defaultCpus = mkOption {
+        type = types.float;
+        default = 0.5;
+        description = "Default CPU limit for deployment containers.";
+      };
+
+      defaultMemoryMb = mkOption {
+        type = types.int;
+        default = 2048;
+        description = "Default memory limit (MB) for deployment containers.";
+      };
+
+      maxCpus = mkOption {
+        type = types.float;
+        default = 4.0;
+        description = "Maximum CPU limit for deployment containers.";
+      };
+
+      maxMemoryMb = mkOption {
+        type = types.int;
+        default = 8192;
+        description = "Maximum memory limit (MB) for deployment containers.";
+      };
+
+      allowCustomResources = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Allow users to specify custom resource limits for their deployments.";
+      };
+
+      # Timeouts
+      jobTimeout = mkOption {
+        type = types.int;
+        default = 320;
+        description = "Timeout (seconds) for build jobs.";
+      };
+
+      deploymentTimeout = mkOption {
+        type = types.int;
+        default = 300;
+        description = "Timeout (seconds) for deployment operations.";
+      };
+
+      # Branding
+      appName = mkOption {
+        type = types.str;
+        default = "/dev/push";
+        description = "Application name displayed in the UI.";
+      };
+
+      appDescription = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Application description displayed in the UI.";
+      };
+
+      emailSenderName = mkOption {
+        type = types.str;
+        default = "/dev/push";
+        description = "Name used as the sender for outgoing emails.";
+      };
+
+      # Logging
+      logLevel = mkOption {
+        type = types.enum [ "DEBUG" "INFO" "WARNING" "ERROR" "CRITICAL" ];
+        default = "WARNING";
+        description = "Application log level.";
+      };
     };
 
     secretsFile = mkOption {
@@ -548,6 +646,19 @@ in {
 
         Set to false to log warnings but attempt to start anyway.
       '';
+    };
+
+    extraEnv = mkOption {
+      type = types.attrsOf types.str;
+      default = {};
+      description = ''
+        Additional environment variables to include in the generated .env file.
+        Use this for settings not covered by explicit options.
+      '';
+      example = {
+        GOOGLE_CLIENT_ID = "your-client-id";
+        AUTH_TOKEN_TTL_DAYS = "30";
+      };
     };
   };
 
